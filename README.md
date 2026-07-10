@@ -93,12 +93,14 @@ nim ls              # list configured models (* = current default)
 
 | Route | Model |
 |---|---|
-| `default` | `meta/llama-3.3-70b-instruct` |
+| `default` | `deepseek-ai/deepseek-v4-pro` |
 | `background` | `meta/llama-3.1-70b-instruct` |
 | `think` | `deepseek-ai/deepseek-v4-pro` |
-| `longContext` (≥60k tokens) | `meta/llama-3.3-70b-instruct` |
+| `longContext` (≥60k tokens) | `deepseek-ai/deepseek-v4-pro` |
 
 All on `https://integrate.api.nvidia.com/v1/chat/completions`. Edit with `nim config`, or use `nim route set` / `nim use`. (Models are fetched from NVIDIA's live `/v1/models` list; NVIDIA retires/renames model IDs over time, so `nim models --all` always shows what your account can actually use.)
+
+`nim init` also installs a `strip-reasoning` ccr transformer plugin. Claude Code sends a `reasoning` parameter that NVIDIA NIM rejects on some models (e.g. DeepSeek); the plugin strips it before the request reaches the provider.
 
 ## Multiple providers
 

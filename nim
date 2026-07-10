@@ -85,35 +85,92 @@ provider_preset() {
 }
 
 # --- config management ------------------------------------------------------
+ensure_plugins() {
+  local plugin_dir="${CCR_DIR}/plugins"
+  mkdir -p "$plugin_dir"
+  cat > "${plugin_dir}/strip-reasoning.js" <<'JS'
+class StripReasoning {
+  name = "strip-reasoning";
+  async transformRequestIn(e) {
+    if (e && typeof e === 'object') {
+      delete e.reasoning;
+      delete e.disable_reasoning;
+    }
+    return e;
+  }
+  async transformResponseOut(e) {
+    return e;
+  }
+}
+
+module.exports = StripReasoning;
+JS
+}
+
+migrate_config() {
+  require_jq || return 0
+  [[ -f "$CONFIG" ]] || return 0
+  ensure_plugins
+  local plugin_path="${CCR_DIR}/plugins/strip-reasoning.js"
+  jq --arg path "$plugin_path" '
+    .transformers = (
+      (.transformers // [])
+      | if any(.path == $path) then . else . + [{"path": $path}] end
+    )
+    | .Providers |= map(
+        if .name == "nvidia" then
+          .transformer = (
+            (.transformer // {})
+            | .use = (
+                (.use // [])
+                | if index("strip-reasoning") then . else . + ["strip-reasoning"] end
+              )
+          )
+        else . end
+      )
+  ' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+}
+
 write_default_config() {
   mkdir -p "$CCR_DIR"
+  ensure_plugins
   if [[ -f "$CONFIG" ]]; then
     cp "$CONFIG" "${CONFIG}.bak.$(date +%s)" 2>/dev/null || true
     info "Backed up existing config to ${CONFIG}.bak.*"
   fi
-  cat > "$CONFIG" <<'JSON'
+  cat > "$CONFIG" <<JSON
 {
   "LOG": true,
   "API_TIMEOUT_MS": 600000,
+  "transformers": [
+    {
+      "path": "${CCR_DIR}/plugins/strip-reasoning.js"
+    }
+  ],
   "Providers": [
     {
       "name": "nvidia",
       "api_base_url": "https://integrate.api.nvidia.com/v1/chat/completions",
-      "api_key": "$NVIDIA_API_KEY",
+      "api_key": "\$NVIDIA_API_KEY",
       "models": [
-        "meta/llama-3.3-70b-instruct",
-        "meta/llama-3.1-70b-instruct",
         "deepseek-ai/deepseek-v4-pro",
         "deepseek-ai/deepseek-v4-flash",
-        "google/gemma-4-31b-it"
-      ]
+        "google/gemma-4-31b-it",
+        "meta/llama-3.3-70b-instruct",
+        "meta/llama-3.1-70b-instruct"
+      ],
+      "transformer": {
+        "use": [
+          "strip-reasoning"
+        ]
+      }
     }
   ],
   "Router": {
-    "default":            "nvidia,meta/llama-3.3-70b-instruct",
+    "default":            "nvidia,deepseek-ai/deepseek-v4-pro",
     "background":         "nvidia,meta/llama-3.1-70b-instruct",
     "think":              "nvidia,deepseek-ai/deepseek-v4-pro",
-    "longContext":        "nvidia,meta/llama-3.3-70b-instruct",
+    "longContext":        "nvidia,deepseek-ai/deepseek-v4-pro",
     "longContextThreshold": 60000
   }
 }
@@ -125,6 +182,8 @@ ensure_config() {
   if [[ ! -f "$CONFIG" ]]; then
     info "No router config found — writing default NIM config."
     write_default_config
+  else
+    migrate_config
   fi
 }
 
@@ -183,6 +242,8 @@ set_default_model() {
   jq --arg p "$provider" --arg m "$model" '
       (.Providers[] | select(.name==$p)).models |= ((. // []) | . + [$m] | unique)
     | .Router.default = ($p + "," + $m)
+    | .Router.think = ($p + "," + $m)
+    | .Router.longContext = ($p + "," + $m)
   ' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
   ok "Default model set to: $provider,$model"
   if have ccr; then load_env; ccr restart >/dev/null 2>&1 || true; fi
@@ -465,6 +526,10 @@ cmd_doctor() {
   [[ -f "$CONFIG" ]] && { ok "config present ($CONFIG)"; pass=$((pass+1)); } || { err "config missing (run: nim init)"; fail=$((fail+1)); }
 
   if [[ -f "$CONFIG" ]]; then
+    [[ -f "${CCR_DIR}/plugins/strip-reasoning.js" ]] \
+      && { ok "strip-reasoning plugin present"; pass=$((pass+1)); } \
+      || { err "strip-reasoning plugin missing (run: nim restart)"; fail=$((fail+1)); }
+
     local v; v=$(ccr_major_version)
     if [[ "$v" == 1 ]]; then ok "ccr is v1.x CLI (compatible)"; pass=$((pass+1));
     else err "ccr is v${v:-?} (needs v1.x CLI: npm install -g @musistudio/claude-code-router@1.0.73)"; fail=$((fail+1)); fi
