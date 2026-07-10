@@ -38,21 +38,42 @@ curl -fsSL -o ~/.local/bin/nim https://raw.githubusercontent.com/aaravchour/nim-
 chmod +x ~/.local/bin/nim
 ```
 
+## Selecting models
+
+The easy way to pick a model — no JSON editing:
+
+```bash
+nim models          # numbered menu of the models in your config → pick one → becomes default
+nim models --all    # fetch the LIVE list of every model NVIDIA NIM offers → pick → set as default
+nim use deepseek-ai/deepseek-r1     # set default directly (auto-adds it to your list)
+nim add mistralai/mixtral-8x22b-instruct-v0.1   # add a model without changing the default
+nim ls              # list configured models (* = current default)
+```
+
+- `nim models` and `nim models --all` use a numbered menu by default, and **auto-upgrade to [fzf](https://github.com/junegunn/fzf) fuzzy search** if you have it installed (great for the long `--all` list).
+- `nim models --all` calls NVIDIA's live `/v1/models` endpoint with your key, so you only see models your account can actually use.
+- Picking a model reloads the router immediately — the next `nim` session uses it.
+- Inside a running Claude Code session you can also switch on the fly: `/model nvidia,deepseek-ai/deepseek-r1`.
+
+> The model commands need `jq` (`brew install jq`). The rest of `nim` works without it.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `nim` | Run Claude Code routed through NVIDIA NIM (forwards extra args to `claude`) |
 | `nim off` | Run Claude Code direct to Anthropic — unsets router env so a global proxy can't leak in |
+| `nim models` | Numbered menu of your models → set as default (uses fzf if installed) |
+| `nim models --all` | Pick from the **live** list of every NIM model → set as default |
+| `nim use <model>` | Set default model directly (auto-adds it to your list) |
+| `nim add <model>` | Add a model to your list without changing the default |
+| `nim ls` | List configured models (`*` = current default) |
 | `nim key` | Set your `nvapi-...` key (stored in `~/.claude-code-router/nim.env`, chmod 600) |
 | `nim config` | Edit the router config (models / routes) in `$EDITOR`, then reloads the router |
-| `nim models` | Interactively pick a model (`ccr model`) |
 | `nim status` | Show install state, key, default model, endpoint |
 | `nim restart` | Reload the router after editing config/key |
 | `nim init` | (Re)write the default NIM config (backs up any existing one) |
 | `nim help` | Show help |
-
-Inside Claude Code you can also switch models on the fly: `/model nvidia,deepseek-ai/deepseek-r1`.
 
 ## Default routing
 
