@@ -50,8 +50,14 @@ have() { command -v "$1" >/dev/null 2>&1; }
 require_jq() { have jq || { err "jq is required for this. Install: brew install jq"; return 1; }; }
 
 ccr_major_version() {
+  # The v1.x CLI has no --version flag (it prints usage), but supports `ccr activate`.
+  # The desktop/v2/v3 editions print a semver and lack `ccr activate`.
   have ccr || { echo 0; return; }
-  ccr --version 2>/dev/null | sed -E 's/[^0-9]*([0-9]+).*/\1/' | head -1 || echo 0
+  if ccr activate 2>/dev/null | grep -q 'ANTHROPIC_BASE_URL'; then
+    echo 1
+  else
+    ccr --version 2>/dev/null | grep -Eo '[0-9]+' | head -1 || echo 0
+  fi
 }
 require_ccr_1x() {
   have ccr || { err "claude-code-router not found. Install: npm install -g @musistudio/claude-code-router"; return 1; }
