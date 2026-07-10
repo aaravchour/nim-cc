@@ -1,24 +1,37 @@
 #!/usr/bin/env bash
-# nim — run Claude Code through NVIDIA NIM (OpenAI-compatible) via claude-code-router.
+# nim — run Claude Code through NVIDIA NIM (or any OpenAI-compatible API) via claude-code-router.
 #
 # Usage:
-#   nim                 Run Claude Code routed through NVIDIA NIM  (NIM mode ON)
-#   nim off             Run Claude Code normally, direct to Anthropic  (NIM mode OFF)
-#   nim <args...>       Same as `nim`, but forwards args to claude (e.g. nim --resume, nim "fix this")
-#   nim models          Pick a model from your config (numbered menu) → set as default
-#   nim models --all    Pick from the LIVE list of every model NVIDIA NIM offers
-#   nim use <model>     Set default model directly, e.g. nim use deepseek-ai/deepseek-r1
+#   nim                 Run Claude Code routed through your active provider  (ON)
+#   nim off             Run Claude Code with your normal setup, not nim  (OFF)
+#   nim <args...>       Same as `nim`, forwards args to claude (e.g. nim --resume, nim "fix this")
+#   nim on | enable     Same as bare `nim` (explicit ON)
+#
+#   nim models          Pick a model from your active provider (numbered menu) → default
+#   nim models --all    Pick from the LIVE list of models the active provider offers → default
+#   nim use <model>     Set default model directly, e.g. nim use deepseek-ai/deepseek-v4-pro
 #   nim add <model>     Add a model to your list (without making it default)
-#   nim ls              List configured models (* = current default)
-#   nim key             Set your NVIDIA API key (nvapi-...)  — stored in ~/.claude-code-router/nim.env
-#   nim config          Edit the router config (models / routes) in $EDITOR
-#   nim status          Show install state, key, default model, endpoint
-#   nim restart         Reload the router after editing config/key
+#   nim ls              List configured models for the active provider (* = current default)
+#
+#   nim provider        List configured providers (active marked with *)
+#   nim provider add    Add a provider (name + endpoint + key, guided)
+#   nim provider use <name>     Switch the active provider (keeps first model if present)
+#   nim provider rm <name>      Remove a provider
+#   nim route           Show how requests are routed (default / background / think / longContext)
+#   nim route set <kind> <model>   e.g. nim route set think deepseek-ai/deepseek-v4-pro
+#
+#   nim doctor          Diagnose the whole chain (ccr, config, key, gateway, provider, live ping)
+#   nim status          Show install state, active provider, key, default model, endpoint
+#   nim key [KEYVAR]    Set an API key (default: active provider's key, stored in nim.env, chmod 600)
+#   nim config          Edit the router config in $EDITOR, then reloads the router
+#   nim restart         Reload the router (after editing config/key)
 #   nim init            (Re)write the default NIM config (backs up any existing one)
+#   nim update          Update nim to the latest version on GitHub
+#   nim uninstall        Remove the nim wrapper and config files (keeps nothing)
 #   nim help            Show this help
 #
 # Setup (one time):
-#   1. npm install -g @musistudio/claude-code-router     # the `ccr` proxy
+#   1. npm install -g @musistudio/claude-code-router     # the `ccr` proxy (needs v1.x CLI)
 #   2. nim key                                            # paste your nvapi-... key
 #   3. nim                                                # run Claude Code on NIM
 #   Get a key at https://build.nvidia.com  (account → API Keys).
@@ -27,9 +40,7 @@ set -euo pipefail
 
 CCR_DIR="${HOME}/.claude-code-router"
 CONFIG="${CCR_DIR}/config.json"
-ENV_FILE="${CCR_DIR}/nim.env"                       # holds NVIDIA_API_KEY (chmod 600)
-NIM_BASE_URL="https://integrate.api.nvidia.com/v1/chat/completions"
-NIM_MODELS_URL="https://integrate.api.nvidia.com/v1/models"
+ENV_FILE="${CCR_DIR}/nim.env"                       # holds provider API keys (chmod 600)
 
 # --- pretty output ---------------------------------------------------------
 err()  { printf '\033[31m✗\033[0m %s\n' "$*" >&2; }
@@ -38,6 +49,35 @@ info() { printf '\033[36mℹ\033[0m %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 require_jq() { have jq || { err "jq is required for this. Install: brew install jq"; return 1; }; }
 
+ccr_major_version() {
+  have ccr || { echo 0; return; }
+  ccr --version 2>/dev/null | sed -E 's/[^0-9]*([0-9]+).*/\1/' | head -1 || echo 0
+}
+require_ccr_1x() {
+  have ccr || { err "claude-code-router not found. Install: npm install -g @musistudio/claude-code-router"; return 1; }
+  local v; v=$(ccr_major_version)
+  if [[ "$v" != 1 ]]; then
+    err "ccr is v${v:-?} (desktop/SQLite edition) — this script needs the v1.x CLI."
+    err "Fix: npm install -g @musistudio/claude-code-router@1.0.73"
+    return 1
+  fi
+}
+
+# --- provider presets ------------------------------------------------------
+# returns "url|keyvar|label" or fails
+provider_preset() {
+  case "$1" in
+    nvidia)     printf 'https://integrate.api.nvidia.com/v1/chat/completions|NVIDIA_API_KEY|NVIDIA NIM' ;;
+    openrouter) printf 'https://openrouter.ai/api/v1/chat/completions|OPENROUTER_API_KEY|OpenRouter' ;;
+    groq)       printf 'https://api.groq.com/openai/v1/chat/completions|GROQ_API_KEY|Groq' ;;
+    deepseek)   printf 'https://api.deepseek.com/chat/completions|DEEPSEEK_API_KEY|DeepSeek' ;;
+    openai)     printf 'https://api.openai.com/v1/chat/completions|OPENAI_API_KEY|OpenAI' ;;
+    ollama)     printf 'http://localhost:11434/v1/chat/completions|-|Ollama (local)' ;;
+    lmstudio)   printf 'http://localhost:1234/v1/chat/completions|-|LM Studio (local)' ;;
+    *) return 1 ;;
+  esac
+}
+
 # --- config management ------------------------------------------------------
 write_default_config() {
   mkdir -p "$CCR_DIR"
@@ -45,28 +85,29 @@ write_default_config() {
     cp "$CONFIG" "${CONFIG}.bak.$(date +%s)" 2>/dev/null || true
     info "Backed up existing config to ${CONFIG}.bak.*"
   fi
-  cat > "$CONFIG" <<JSON
+  cat > "$CONFIG" <<'JSON'
 {
   "LOG": true,
   "API_TIMEOUT_MS": 600000,
   "Providers": [
     {
       "name": "nvidia",
-      "api_base_url": "${NIM_BASE_URL}",
-      "api_key": "\$NVIDIA_API_KEY",
+      "api_base_url": "https://integrate.api.nvidia.com/v1/chat/completions",
+      "api_key": "$NVIDIA_API_KEY",
       "models": [
-        "nvidia/llama-3.1-nemotron-70b-instruct",
         "meta/llama-3.3-70b-instruct",
-        "deepseek-ai/deepseek-r1",
-        "meta/llama-3.1-405b-instruct"
+        "meta/llama-3.1-70b-instruct",
+        "deepseek-ai/deepseek-v4-pro",
+        "deepseek-ai/deepseek-v4-flash",
+        "google/gemma-4-31b-it"
       ]
     }
   ],
   "Router": {
-    "default":       "nvidia,nvidia/llama-3.1-nemotron-70b-instruct",
-    "background":    "nvidia,meta/llama-3.3-70b-instruct",
-    "think":         "nvidia,deepseek-ai/deepseek-r1",
-    "longContext":   "nvidia,deepseek-ai/deepseek-r1",
+    "default":            "nvidia,meta/llama-3.3-70b-instruct",
+    "background":         "nvidia,meta/llama-3.1-70b-instruct",
+    "think":              "nvidia,deepseek-ai/deepseek-v4-pro",
+    "longContext":        "nvidia,meta/llama-3.3-70b-instruct",
     "longContextThreshold": 60000
   }
 }
@@ -82,40 +123,66 @@ ensure_config() {
 }
 
 # --- key / env --------------------------------------------------------------
-ensure_key() {
-  if [[ ! -f "$ENV_FILE" ]] || ! grep -q 'NVIDIA_API_KEY=.' "$ENV_FILE" 2>/dev/null; then
-    err "NVIDIA API key not set. Run: nim key"
-    return 1
-  fi
+# $1 = keyvar (e.g. NVIDIA_API_KEY); prints value from nim.env, or empty
+key_for_keyvar() {
+  local kv="${1:-}"
+  [[ -n "$kv" && "$kv" != "null" && "$kv" != "-" ]] || return 0
+  grep -o "^${kv}=.*" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-
 }
 
+# exports ALL keys defined in nim.env into this process env (so ccr gateway can use them)
 load_env() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  set -a
   # shellcheck disable=SC1090
-  [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
-  export NVIDIA_API_KEY
+  source "$ENV_FILE"
+  set +a
+}
+
+# --- active provider helpers ------------------------------------------------
+active_provider()  { [[ -f "$CONFIG" ]] && jq -r '.Router.default // ""' "$CONFIG" 2>/dev/null | cut -d, -f1 || true; }
+active_provider_url() {
+  local n; n=$(active_provider)
+  [[ -n "$n" ]] && jq -r --arg n "$n" '.Providers[]|select(.name==$n)|.api_base_url // ""' "$CONFIG" 2>/dev/null || true
+}
+active_provider_keyvar() {
+  local n; n=$(active_provider)
+  [[ -n "$n" ]] && jq -r --arg n "$n" '.Providers[]|select(.name==$n)|.api_key // ""' "$CONFIG" 2>/dev/null | sed 's#^\$##' || true
+}
+active_needs_key() {
+  local kv; kv=$(active_provider_keyvar)
+  [[ -n "$kv" && "$kv" != "null" && "$kv" != "-" ]]
+}
+ensure_active_key() {
+  if active_needs_key; then
+    local kv; kv=$(active_provider_keyvar)
+    if [[ -z "$(key_for_keyvar "$kv")" ]]; then
+      err "Key '$kv' (for active provider) is not set. Run: nim key $kv"
+      return 1
+    fi
+  fi
 }
 
 # --- model helpers ----------------------------------------------------------
 current_default_model() {
   [[ -f "$CONFIG" ]] || return 0
-  jq -r '.Router.default // ""' "$CONFIG" 2>/dev/null | sed 's/^nvidia,//'
+  jq -r '.Router.default // ""' "$CONFIG" 2>/dev/null | sed 's#^[^,]*,##'
 }
 
+# set default route to provider,model ; adds model to that provider's list
 set_default_model() {
-  # $1 = model id (provider-prefixed, e.g. deepseek-ai/deepseek-r1)
-  local model="$1"
+  local provider="$1" model="$2"
   require_jq || return 1
   ensure_config
-  jq --arg m "$model" '
-      (.Providers[] | select(.name=="nvidia")).models |= ((. // []) | . + [$m] | unique)
-    | .Router.default = "nvidia,\($m)"
+  jq --arg p "$provider" --arg m "$model" '
+      (.Providers[] | select(.name==$p)).models |= ((. // []) | . + [$m] | unique)
+    | .Router.default = ($p + "," + $m)
   ' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
-  ok "Default model set to: nvidia,$model"
-  if have ccr; then load_env; ccr restart >/dev/null 2>&1 && ok "Router reloaded." || true; fi
+  ok "Default model set to: $provider,$model"
+  if have ccr; then load_env; ccr restart >/dev/null 2>&1 || true; fi
 }
 
 # Interactive picker. Reads candidate model IDs from stdin, prints chosen one.
-# Uses fzf if available (fuzzy search), else a numbered menu.
 # $1 = current default id (for the "<- current" marker)
 pick_model() {
   local current="${1:-}" items=() line
@@ -148,44 +215,53 @@ pick_model() {
 
 # --- commands ---------------------------------------------------------------
 cmd_on() {
-  have ccr    || { err "claude-code-router not found. Install: npm install -g @musistudio/claude-code-router"; return 1; }
+  require_ccr_1x || return 1
   have claude || { err "claude not found. Install Claude Code first."; return 1; }
   ensure_config
-  ensure_key
-  load_env
-  ccr start >/dev/null 2>&1 || true          # start gateway if not running (idempotent)
-  info "NIM mode ON — routing Claude Code through NVIDIA NIM"
-  exec ccr code "$@"                          # ccr code sets ANTHROPIC_BASE_URL + launches claude
+  ensure_active_key || return 1
+  load_env                                 # export keys into THIS process (gateway inherits them)
+  ccr restart >/dev/null 2>&1 || ccr start >/dev/null 2>&1 || true   # restart so gateway has fresh keys
+  # ccr activate forces ANTHROPIC_BASE_URL -> :3456, overriding any inherited setup (e.g. Ollama)
+  eval "$(ccr activate)"
+  # drop Claude Code tier->model overrides (e.g. glm-5.2:cloud) so ccr routes by its Router config
+  unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
+  info "NIM mode ON — Claude Code → ccr (:3456) → $(active_provider) [$(current_default_model)]"
+  exec claude "$@"
 }
 
 cmd_off() {
   have claude || { err "claude not found."; return 1; }
-  info "NIM mode OFF — using Claude Code directly (Anthropic)"
-  # unset any router env so a globally-configured proxy doesn't leak into "off" mode
-  exec env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY claude "$@"
+  info "NIM mode OFF — using your normal Claude Code setup"
+  # inherit shell env unchanged: for you that's Ollama; for others, real Anthropic. nim sets no globals.
+  exec claude "$@"
 }
 
 cmd_models() {
   require_jq || return 1
-  ensure_key || return 1
+  ensure_active_key || return 1
   load_env
   local all=0
   [[ "${1:-}" == "-a" || "${1:-}" == "--all" ]] && all=1
 
+  local provider; provider=$(active_provider)
+  [[ -n "$provider" ]] || { err "No active provider in config. Run: nim init"; return 1; }
   local current; current=$(current_default_model)
-  local chosen
+  local chosen url kv key
 
   if (( all )); then
-    info "Fetching live model list from NVIDIA NIM..."
-    local resp
-    resp=$(curl -fsS -H "Authorization: Bearer ${NVIDIA_API_KEY}" "${NIM_MODELS_URL}") \
-      || { err "Failed to fetch models from NIM (check your key / network)."; return 1; }
+    url=$(active_provider_url)
+    if active_needs_key; then kv=$(active_provider_keyvar); key=$(key_for_keyvar "$kv"); fi
+    info "Fetching live model list from ${url}..."
+    local resp auth=()
+    [[ -n "${key:-}" ]] && auth=(-H "Authorization: Bearer ${key}")
+    resp=$(curl -fsS "${auth[@]}" "${url%/chat/completions}/models" 2>/dev/null) \
+      || { err "Failed to fetch models (check key / network / endpoint)."; return 1; }
     chosen=$(printf '%s\n' "$resp" \
       | jq -r '(.data // []) | .[].id // empty' 2>/dev/null | sort -u \
       | pick_model "$current") || { info "No change."; return 0; }
   else
     ensure_config
-    chosen=$(jq -r '(.Providers[] | select(.name=="nvidia").models) // [] | .[]' "$CONFIG" 2>/dev/null \
+    chosen=$(jq -r --arg p "$provider" '(.Providers[]|select(.name==$p).models) // [] | .[]' "$CONFIG" 2>/dev/null \
       | pick_model "$current") || { info "No change."; return 0; }
   fi
 
@@ -193,15 +269,17 @@ cmd_models() {
     info "No model selected; nothing changed."
     return 0
   fi
-  set_default_model "$chosen"
+  set_default_model "$provider" "$chosen"
 }
 
 cmd_use() {
   local model="${1:-}"
-  [[ -n "$model" ]] || { err "Usage: nim use <model>   (e.g. nim use deepseek-ai/deepseek-r1)"; return 1; }
+  [[ -n "$model" ]] || { err "Usage: nim use <model>   (e.g. nim use deepseek-ai/deepseek-v4-pro)"; return 1; }
   require_jq || return 1
+  local provider; provider=$(active_provider)
+  [[ -n "$provider" ]] || { err "No active provider. Run: nim init"; return 1; }
   load_env
-  set_default_model "$model"
+  set_default_model "$provider" "$model"
 }
 
 cmd_add() {
@@ -209,40 +287,243 @@ cmd_add() {
   [[ -n "$model" ]] || { err "Usage: nim add <model>   (e.g. nim add mistralai/mixtral-8x22b-instruct-v0.1)"; return 1; }
   require_jq || return 1
   ensure_config
-  jq --arg m "$model" \
-    '(.Providers[] | select(.name=="nvidia")).models |= ((. // []) | . + [$m] | unique)' \
+  local provider; provider=$(active_provider)
+  [[ -n "$provider" ]] || { err "No active provider. Run: nim init"; return 1; }
+  jq --arg p "$provider" --arg m "$model" \
+    '(.Providers[]|select(.name==$p)).models |= ((. // []) | . + [$m] | unique)' \
     "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
-  ok "Added model: $model"
+  ok "Added model: $model  (provider: $provider)"
   info "Make it default with: nim use \"$model\"  (or pick with: nim models)"
 }
 
 cmd_ls() {
   require_jq || return 1
   ensure_config
+  local provider; provider=$(active_provider)
+  [[ -n "$provider" ]] || { err "No active provider."; return 1; }
   local current; current=$(current_default_model)
-  echo "Configured NIM models (* = current default):"
+  echo "Configured models for provider '$provider' (* = current default):"
   local m
   while IFS= read -r m; do
     if [[ "$m" == "$current" ]]; then printf '  * %s\n' "$m"
     else printf '    %s\n' "$m"; fi
-  done < <(jq -r '(.Providers[] | select(.name=="nvidia").models) // [] | .[]' "$CONFIG" 2>/dev/null)
-  [[ -n "$current" ]] && printf '\nCurrent default: nvidia,%s\n' "$current"
+  done < <(jq -r --arg p "$provider" '(.Providers[]|select(.name==$p).models) // [] | .[]' "$CONFIG" 2>/dev/null)
+  [[ -n "$current" ]] && printf '\nCurrent default: %s,%s\n' "$provider" "$current"
+}
+
+cmd_provider() {
+  require_jq || return 1
+  ensure_config
+  local sub="${1:-}"
+  case "$sub" in
+    "")
+      local active; active=$(active_provider)
+      echo "Configured providers (* = active):"
+      local n url kv
+      while IFS=$'\t' read -r n url kv; do
+        local mark=""
+        [[ "$n" == "$active" ]] && mark="*"
+        printf '  %s %-12s  %s  key:%s\n' "$mark" "$n" "$url" "${kv:--}"
+      done < <(jq -r '.Providers[] | [.name, .api_base_url, (.api_key // "-")] | @tsv' "$CONFIG" 2>/dev/null)
+      echo
+      info "active: ${active}  model: $(current_default_model)"
+      echo "Add: nim provider add | Switch: nim provider use <name> | Remove: nim provider rm <name>"
+      ;;
+    add)
+      shift
+      local name="${1:-}"
+      if [[ -z "$name" ]]; then
+        echo "Provider presets:" >&2
+        echo "  nvidia openrouter groq deepseek openai ollama lmstudio" >&2
+        printf 'Provider name (preset or custom): ' >&2
+        read -r name </dev/tty || true
+      fi
+      [[ -n "$name" ]] || { err "No provider name given."; return 1; }
+      local preset url kv label
+      if preset=$(provider_preset "$name"); then
+        url=$(printf '%s' "$preset" | cut -d'|' -f1)
+        kv=$(printf '%s' "$preset" | cut -d'|' -f2)
+        label=$(printf '%s' "$preset" | cut -d'|' -f3)
+        info "Using preset: $label"
+      else
+        printf 'Endpoint URL (OpenAI-compatible, chat/completions): ' >&2
+        read -r url </dev/tty || true
+        printf 'Key env var name (e.g. MYAPI_KEY), or - for none: ' >&2
+        read -r kv </dev/tty || true
+        [[ -z "$kv" ]] && kv="-"
+      fi
+      local keyval="\$${kv}"
+      [[ "$kv" == "-" ]] && keyval="-"
+      local model=""
+      printf 'First model id for this provider (or blank to skip): ' >&2
+      read -r model </dev/tty || true
+      local models='[]'
+      [[ -n "$model" ]] && models=$(printf '%s' "$model" | jq -R . | jq -s .)
+      jq --arg n "$name" --arg u "$url" --argjson m "$models" \
+        --arg k "$keyval" \
+        '.Providers += [{"name":$n,"api_base_url":$u,"api_key":$k,"models":$m}]' \
+        "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+      ok "Provider '$name' added."
+      if [[ "$kv" != "-" ]]; then
+        if [[ -z "$(key_for_keyvar "$kv")" ]]; then
+          info "Set its key now: nim key $kv"
+        fi
+      fi
+      info "Activate with: nim provider use $name"
+      if have ccr; then load_env; ccr restart >/dev/null 2>&1 || true; fi
+      ;;
+    use)
+      shift
+      local name="${1:-}"
+      [[ -n "$name" ]] || { err "Usage: nim provider use <name>"; return 1; }
+      local exists
+      exists=$(jq -r --arg n "$name" '.Providers[]|select(.name==$n)|.name // empty' "$CONFIG" 2>/dev/null)
+      [[ -n "$exists" ]] || { err "No provider named '$name'. Run: nim provider add"; return 1; }
+      local model
+      model=$(jq -r --arg n "$name" '(.Providers[]|select(.name==$n).models) // [] | .[0] // empty' "$CONFIG" 2>/dev/null)
+      if [[ -z "$model" ]]; then
+        jq --arg n "$name" '.Router.default = ($n + ",")' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+        ok "Active provider set to: $name  (no model yet — set one with: nim use <model>)"
+        if have ccr; then load_env; ccr restart >/dev/null 2>&1 || true; fi
+      else
+        set_default_model "$name" "$model"
+        ok "Active provider set to: $name  (default model: $model)"
+      fi
+      ;;
+    rm)
+      shift
+      local name="${1:-}"
+      [[ -n "$name" ]] || { err "Usage: nim provider rm <name>"; return 1; }
+      [[ "$name" == "nvidia" ]] && { err "Won't remove the built-in 'nvidia' provider."; return 1; }
+      jq --arg n "$name" '.Providers |= map(select(.name != $n))' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+      local active; active=$(active_provider)
+      if [[ "$active" == "$name" ]]; then
+        local new; new=$(jq -r '.Providers[0].name // empty' "$CONFIG" 2>/dev/null)
+        if [[ -n "$new" ]]; then
+          local m0; m0=$(jq -r '.Providers[0].models[0] // empty' "$CONFIG" 2>/dev/null)
+          [[ -n "$m0" ]] && set_default_model "$new" "$m0" || jq '.Router.default = "'"$new"',"' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+        fi
+      fi
+      ok "Removed provider '$name'."
+      if have ccr; then load_env; ccr restart >/dev/null 2>&1 || true; fi
+      ;;
+    *) err "Unknown provider subcommand: '$sub'. Try: add | use <name> | rm <name>"; return 1 ;;
+  esac
+}
+
+cmd_route() {
+  require_jq || return 1
+  ensure_config
+  local sub="${1:-}"
+  case "$sub" in
+    "")
+      echo "Routing table:"
+      local k v
+      while IFS=$'\t' read -r k v; do
+        printf '  %-16s %s\n' "$k" "$v"
+      done < <(jq -r '.Router | to_entries[] | [.key, (.value|tostring)] | @tsv' "$CONFIG" 2>/dev/null)
+      echo
+      info "Set with: nim route set <default|background|think|longContext> <model>"
+      ;;
+    set)
+      shift
+      local kind="${1:-}" model="${2:-}"
+      [[ -n "$kind" && -n "$model" ]] || { err "Usage: nim route set <kind> <model>  (e.g. nim route set think deepseek-ai/deepseek-v4-pro)"; return 1; }
+      case "$kind" in
+        default|background|think|longContext|longContextThreshold) ;;
+        *) err "Unknown route kind '$kind'. Use: default|background|think|longContext|longContextThreshold"; return 1 ;;
+      esac
+      local provider; provider=$(active_provider)
+      if [[ "$kind" == "longContextThreshold" ]]; then
+        [[ "$model" =~ ^[0-9]+$ ]] || { err "longContextThreshold must be a number (tokens)."; return 1; }
+        jq --arg t "$model" '.Router.longContextThreshold = ($t|tonumber)' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+        ok "longContextThreshold set to $model"
+      else
+        jq --arg k "$kind" --arg v "${provider},${model}" '.Router[$k] = $v' \
+          "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+        ok "$kind route set to ${provider},${model}"
+      fi
+      if have ccr; then load_env; ccr restart >/dev/null 2>&1 || true; fi
+      ;;
+    *) err "Usage: nim route  |  nim route set <kind> <model>"; return 1 ;;
+  esac
+}
+
+cmd_doctor() {
+  require_jq || return 1
+  echo "=== nim doctor ==="
+  local pass=0 fail=0
+  have ccr    && { ok "ccr installed";         pass=$((pass+1)); } || { err "ccr missing (npm install -g @musistudio/claude-code-router)"; fail=$((fail+1)); }
+  have claude && { ok "claude installed";      pass=$((pass+1)); } || { err "claude missing"; fail=$((fail+1)); }
+  have jq     && { ok "jq installed";          pass=$((pass+1)); } || { err "jq missing (brew install jq)"; fail=$((fail+1)); }
+  [[ -f "$CONFIG" ]] && { ok "config present ($CONFIG)"; pass=$((pass+1)); } || { err "config missing (run: nim init)"; fail=$((fail+1)); }
+
+  if [[ -f "$CONFIG" ]]; then
+    local v; v=$(ccr_major_version)
+    if [[ "$v" == 1 ]]; then ok "ccr is v1.x CLI (compatible)"; pass=$((pass+1));
+    else err "ccr is v${v:-?} (needs v1.x CLI: npm install -g @musistudio/claude-code-router@1.0.73)"; fail=$((fail+1)); fi
+
+    local provider; provider=$(active_provider)
+    local def; def=$(jq -r '.Router.default // ""' "$CONFIG" 2>/dev/null)
+    if [[ -n "$provider" && -n "$def" && "$def" == *,* ]]; then ok "active provider: $provider  default: $(current_default_model)"; pass=$((pass+1));
+    else err "Router.default not set properly ('$def'). Run: nim use <model>"; fail=$((fail+1)); fi
+
+    if active_needs_key; then
+      local kv; kv=$(active_provider_keyvar)
+      if [[ -n "$(key_for_keyvar "$kv")" ]]; then ok "provider key '$kv' is set in nim.env"; pass=$((pass+1));
+      else err "provider key '$kv' not set (run: nim key $kv)"; fail=$((fail+1)); fi
+    else
+      ok "active provider needs no key"; pass=$((pass+1));
+    fi
+  fi
+
+  if have ccr && [[ -f "$CONFIG" ]]; then
+    info "restarting gateway with current keys loaded (matches a real 'nim' run)..."
+    load_env
+    ccr restart >/dev/null 2>&1 || true
+    sleep 1
+    local code
+    code=$(curl -s -o /tmp/nim_doctor.json -w "%{http_code}" -X POST http://127.0.0.1:3456/v1/messages \
+      -H "Content-Type: application/json" -H "x-api-key: test" -H "anthropic-version: 2023-06-01" \
+      -d '{"model":"claude-opus-4-8[1m]","max_tokens":5,"messages":[{"role":"user","content":"ping"}]}' 2>/dev/null || echo 000)
+    case "$code" in
+      200) ok "end-to-end gateway -> provider: HTTP 200 ✓"; pass=$((pass+1)); rm -f /tmp/nim_doctor.json ;;
+      429|503) info "reached provider but got HTTP $code (transient provider capacity — retry later)"; rm -f /tmp/nim_doctor.json ;;
+      401) err "end-to-end HTTP 401 from provider — gateway lacks the key. Run: nim key, then nim restart"; fail=$((fail+1)); rm -f /tmp/nim_doctor.json ;;
+      404) err "end-to-end HTTP 404 — model not available for your account. Switch: nim models --all"; fail=$((fail+1)); rm -f /tmp/nim_doctor.json ;;
+      000) err "gateway not reachable on :3456 (is ccr running?). Run: nim restart"; fail=$((fail+1)); ;;
+      *)    err "end-to-end HTTP $code — see /tmp/nim_doctor.json"; fail=$((fail+1)); rm -f /tmp/nim_doctor.json ;;
+    esac
+  fi
+
+  echo
+  echo "Result: ${pass} ok, ${fail} problem(s)"
+  [[ "$fail" -eq 0 ]] && ok "All checks passed — 'nim' should work." || { err "Fix the above, then: nim doctor"; return 1; }
 }
 
 cmd_key() {
   mkdir -p "$CCR_DIR"
-  printf 'Enter your NVIDIA API key (nvapi-...): '
+  local kv="${1:-}"
+  if [[ -z "$kv" ]]; then
+    kv=$(active_provider_keyvar 2>/dev/null)
+    [[ -z "$kv" || "$kv" == "null" || "$kv" == "-" ]] && kv="NVIDIA_API_KEY"
+  fi
+  local label
+  label=$(active_provider 2>/dev/null) || label="provider"
+  printf 'API key for %s (stored as %s in %s): ' "$label" "$kv" "$ENV_FILE"
   local KEY
   read -rs KEY </dev/tty || read -rs KEY
   echo
   [[ -n "$KEY" ]] || { err "No key entered."; return 1; }
-  printf 'NVIDIA_API_KEY=%s\n' "$KEY" > "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  ok "Key saved to $ENV_FILE (chmod 600)"
-  if have ccr; then
-    load_env
-    ccr restart >/dev/null 2>&1 && ok "Router reloaded with new key." || true
+  if grep -q "^${kv}=" "$ENV_FILE" 2>/dev/null; then
+    { grep -v "^${kv}=" "$ENV_FILE" 2>/dev/null; printf '%s=%s\n' "$kv" "$KEY"; } > "${ENV_FILE}.tmp"
+    mv "${ENV_FILE}.tmp" "$ENV_FILE"
+  else
+    printf '%s=%s\n' "$kv" "$KEY" >> "$ENV_FILE"
   fi
+  chmod 600 "$ENV_FILE"
+  ok "Saved $kv in $ENV_FILE (chmod 600)"
+  if have ccr; then load_env; ccr restart >/dev/null 2>&1 && ok "Router reloaded with new key." || true; fi
   info "Get a key at https://build.nvidia.com  (account → API Keys)"
 }
 
@@ -253,44 +534,84 @@ cmd_config() {
 }
 
 cmd_restart() {
-  have ccr || { err "ccr not found."; return 1; }
+  require_ccr_1x || return 1
   load_env
   ccr restart
   ok "Router reloaded."
 }
 
 cmd_status() {
-  printf 'nim — NVIDIA NIM bridge for Claude Code\n\n'
-  printf 'ccr installed:     '; have ccr    && ok 'yes' || err 'no  (npm install -g @musistudio/claude-code-router)'
+  printf 'nim — bridge for Claude Code → OpenAI-compatible providers (default: NVIDIA NIM)\n\n'
+  printf 'ccr installed:     '; have ccr    && ok 'yes' || err 'no  (npm install -g @musistudio/claude-code-router@1.0.73)'
+  printf 'ccr version:       '; have ccr    && echo "    v$(ccr_major_version).x" || echo '    —'
   printf 'claude installed:  '; have claude && ok 'yes' || err 'no'
-  printf 'jq installed:      '; have jq     && ok 'yes' || err 'no  (brew install jq — needed for nim models/use/add/ls)'
-  printf 'config:            '; [[ -f "$CONFIG" ]]   && ok "$CONFIG" || err 'missing  (run: nim init)'
-  printf 'api key:           '; [[ -f "$ENV_FILE" ]] && grep -q 'NVIDIA_API_KEY=.' "$ENV_FILE" 2>/dev/null && ok 'set' || err 'missing  (run: nim key)'
+  printf 'jq installed:       '; have jq    && ok 'yes' || err 'no  (brew install jq — needed for model/provider/route/doctor)'
+  printf 'config:            '; [[ -f "$CONFIG" ]] && ok "$CONFIG" || err 'missing  (run: nim init)'
   if [[ -f "$CONFIG" ]]; then
+    local p; p=$(active_provider)
+    [[ -n "$p" ]] && printf 'active provider:   %s\n' "$p"
+    printf 'endpoint:          %s\n' "$(active_provider_url)"
+    if active_needs_key; then
+      local kv; kv=$(active_provider_keyvar)
+      printf 'api key (%s):   ' "$kv"
+      [[ -n "$(key_for_keyvar "$kv")" ]] && ok 'set' || err 'missing  (run: nim key)'
+    fi
     local def; def=$(current_default_model)
-    [[ -n "$def" ]] && printf 'default model:     nvidia,%s\n' "$def"
+    [[ -n "$def" ]] && printf 'default model:     %s,%s\n' "$p" "$def"
   fi
-  printf 'endpoint:          %s\n' "$NIM_BASE_URL"
-  printf 'live models:       %s\n' "$NIM_MODELS_URL"
 }
 
-usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
+cmd_update() {
+  local url="https://raw.githubusercontent.com/aaravchour/nim-cc/main/nim"
+  local dest="$0"
+  have curl || { err "curl required."; return 1; }
+  info "Updating $dest from $url ..."
+  curl -fsSL "$url" -o "${dest}.new" || { err "Download failed."; return 1; }
+  head -1 "${dest}.new" | grep -q '^#!/' || { err "Downloaded file does not look like a script."; rm -f "${dest}.new"; return 1; }
+  mv "${dest}.new" "$dest"
+  chmod +x "$dest"
+  ok "Updated. Run: nim help"
+}
+
+cmd_uninstall() {
+  info "This will remove:"
+  printf '  %s\n' "$0"
+  printf '  %s\n' "$CONFIG"
+  printf '  %s\n' "$ENV_FILE"
+  printf 'Remove them? [y/N] '
+  local yn; read -r yn </dev/tty || true
+  [[ "$yn" == "y" || "$yn" == "Y" ]] || { info "Aborted."; return 0; }
+  rm -f "$0" "$CONFIG" "$ENV_FILE" 2>/dev/null
+  rmdir "$CCR_DIR" 2>/dev/null || true
+  if have ccr; then ccr stop >/dev/null 2>&1 || true; info "ccr still installed (npm uninstall -g @musistudio/claude-code-router to remove)."; fi
+  ok "nim uninstalled."
+}
+
+usage() {
+  awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 && !/^#/ {exit}' "$0"
+}
 
 # --- dispatch ----------------------------------------------------------------
 main() {
   case "${1:-}" in
-    off)        shift; cmd_off "$@" ;;
-    models)     shift; cmd_models "$@" ;;
-    use)        shift; cmd_use "$@" ;;
-    add)        shift; cmd_add "$@" ;;
-    ls|list)    cmd_ls ;;
-    key)        cmd_key ;;
-    config)     cmd_config ;;
-    status)     cmd_status ;;
-    restart)    cmd_restart ;;
-    init)       write_default_config ;;
-    help|-h|--help) usage ;;
-    *)          cmd_on "$@" ;;   # bare `nim` OR `nim <args>` → claude on NIM
+    on|enable)        shift; cmd_on "$@" ;;
+    off)             shift; cmd_off "$@" ;;
+    models)          shift; cmd_models "$@" ;;
+    use)             shift; cmd_use "$@" ;;
+    add)             shift; cmd_add "$@" ;;
+    ls|list)         cmd_ls ;;
+    provider)        shift; cmd_provider "$@" ;;
+    route)           shift; cmd_route "$@" ;;
+    doctor)          shift; cmd_doctor "$@" ;;
+    key)             shift; cmd_key "$@" ;;
+    config)          cmd_config ;;
+    status)          cmd_status ;;
+    restart)         shift; cmd_restart "$@" ;;
+    init)            write_default_config ;;
+    update)          cmd_update ;;
+    uninstall)       cmd_uninstall ;;
+    help|-h|--help)  usage ;;
+    *)               cmd_on "$@" ;;   # bare `nim` OR `nim <args>` → claude on NIM
   esac
 }
 

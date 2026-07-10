@@ -9,15 +9,17 @@ nim off      # Claude Code normally          (NIM mode OFF)
 
 Claude Code speaks the **Anthropic** API format, but NVIDIA NIM speaks **OpenAI** format — so the two can't talk directly. `nim-cc` uses `claude-code-router` (`ccr`) as a local translation proxy and wires everything up for you: config, API key, gateway, and env vars.
 
-- **Self-contained** — env vars are only set for the `claude` process it spawns; nothing is exported to your shell or persisted globally.
+- **Self-contained** — env vars are only set for the `claude` process it spawns; nothing is exported to your shell or persisted globally. `nim off` inherits your shell untouched, so it works whether your "normal" setup is Anthropic, Ollama, or anything else.
 - **Non-destructive** — `nim init` backs up any existing `~/.claude-code-router/config.json`.
 - **Key stays private** — stored in `~/.claude-code-router/nim.env` (chmod 600), referenced as `$NVIDIA_API_KEY` in the config.
+- **Multiple providers** — NIM by default, but you can add OpenRouter, Groq, DeepSeek, OpenAI, or a local Ollama/LM Studio with `nim provider add` and switch between them with one command.
+- **Self-diagnosis** — `nim doctor` checks the whole chain (ccr, config, key, gateway, live provider ping) and tells you exactly what to fix.
 
 ## Quick start
 
 ```bash
-# 1. install the router (one time)
-npm install -g @musistudio/claude-code-router
+# 1. install the router (one time)  — must be the v1.x CLI, NOT the desktop app
+npm install -g @musistudio/claude-code-router@1.0.73
 
 # 2. install nim-cc
 curl -fsSL https://raw.githubusercontent.com/aaravchour/nim-cc/main/install.sh | bash
@@ -28,7 +30,7 @@ nim key
 # 4. run
 nim          # Claude Code on NIM
 nim off      # Claude Code normally
-nim status   # check state anytime
+nim doctor   # diagnose the whole chain anytime
 ```
 
 `install.sh` copies `nim` to `~/.local/bin/nim` (on your `$PATH` if you use the standard setup). To install manually instead:
@@ -61,18 +63,28 @@ nim ls              # list configured models (* = current default)
 
 | Command | What it does |
 |---|---|
-| `nim` | Run Claude Code routed through NVIDIA NIM (forwards extra args to `claude`) |
-| `nim off` | Run Claude Code direct to Anthropic — unsets router env so a global proxy can't leak in |
+| `nim` / `nim on` / `nim enable` | Run Claude Code routed through your active provider (forwards extra args to `claude`) |
+| `nim off` | Run Claude Code with your normal setup — inherits your shell env untouched (works for Anthropic, Ollama, etc.) |
+| `nim <args...>` | Same as `nim`, but forwards args to claude (e.g. `nim --resume`, `nim "fix this")` |
 | `nim models` | Numbered menu of your models → set as default (uses fzf if installed) |
-| `nim models --all` | Pick from the **live** list of every NIM model → set as default |
+| `nim models --all` | Pick from the **live** list of every model the active provider offers → set as default |
 | `nim use <model>` | Set default model directly (auto-adds it to your list) |
 | `nim add <model>` | Add a model to your list without changing the default |
-| `nim ls` | List configured models (`*` = current default) |
-| `nim key` | Set your `nvapi-...` key (stored in `~/.claude-code-router/nim.env`, chmod 600) |
-| `nim config` | Edit the router config (models / routes) in `$EDITOR`, then reloads the router |
-| `nim status` | Show install state, key, default model, endpoint |
+| `nim ls` | List configured models for the active provider (`*` = current default) |
+| `nim provider` | List configured providers (active marked with `*`) |
+| `nim provider add [name]` | Add a provider — presets: `nvidia openrouter groq deepseek openai ollama lmstudio` |
+| `nim provider use <name>` | Switch the active provider |
+| `nim provider rm <name>` | Remove a provider |
+| `nim route` | Show how requests are routed (`default` / `background` / `think` / `longContext`) |
+| `nim route set <kind> <model>` | Set a route, e.g. `nim route set think deepseek-ai/deepseek-v4-pro` |
+| `nim key [KEYVAR]` | Set an API key (default: the active provider's key; stored in `~/.claude-code-router/nim.env`, chmod 600) |
+| `nim doctor` | Diagnose the whole chain — ccr, config, key, gateway, and a live end-to-end ping |
+| `nim status` | Show install state, active provider, key, default model, endpoint |
+| `nim config` | Edit the router config in `$EDITOR`, then reloads the router |
 | `nim restart` | Reload the router after editing config/key |
 | `nim init` | (Re)write the default NIM config (backs up any existing one) |
+| `nim update` | Update `nim` to the latest version from GitHub |
+| `nim uninstall` | Remove the `nim` wrapper and its config files |
 | `nim help` | Show help |
 
 ## Default routing
@@ -81,18 +93,33 @@ nim ls              # list configured models (* = current default)
 
 | Route | Model |
 |---|---|
-| `default` | `nvidia/llama-3.1-nemotron-70b-instruct` |
-| `background` | `meta/llama-3.3-70b-instruct` |
-| `think` | `deepseek-ai/deepseek-r1` |
-| `longContext` (≥60k tokens) | `deepseek-ai/deepseek-r1` |
+| `default` | `meta/llama-3.3-70b-instruct` |
+| `background` | `meta/llama-3.1-70b-instruct` |
+| `think` | `deepseek-ai/deepseek-v4-pro` |
+| `longContext` (≥60k tokens) | `meta/llama-3.3-70b-instruct` |
 
-All on `https://integrate.api.nvidia.com/v1/chat/completions`. Edit with `nim config`.
+All on `https://integrate.api.nvidia.com/v1/chat/completions`. Edit with `nim config`, or use `nim route set` / `nim use`. (Models are fetched from NVIDIA's live `/v1/models` list; NVIDIA retires/renames model IDs over time, so `nim models --all` always shows what your account can actually use.)
+
+## Multiple providers
+
+NIM is the default, but you can route Claude Code through any OpenAI-compatible endpoint. Presets are built in:
+
+```bash
+nim provider add openrouter     # add OpenRouter (prompts for endpoint/key/model)
+nim key OPENROUTER_API_KEY       # set that provider's key
+nim provider use openrouter      # switch the active provider
+nim models --all                 # pick a model from OpenRouter's live list
+```
+
+Provider presets: `nvidia`, `openrouter`, `groq`, `deepseek`, `openai`, `ollama` (local), `lmstudio` (local). For a custom endpoint, `nim provider add` and type a name that isn't a preset — it'll prompt for the URL and key variable. Local providers (`ollama`, `lmstudio`) need no key.
+
+`~/.claude-code-router/nim.env` can hold multiple keys (one per line, `KEYVAR=value`); `nim` exports all of them when it starts the gateway.
 
 ## Files
 
 - `~/nim-cc` → installed to `~/.local/bin/nim`
-- `~/.claude-code-router/config.json` — router config (NIM provider + routes)
-- `~/.claude-code-router/nim.env` — your `NVIDIA_API_KEY` (chmod 600)
+- `~/.claude-code-router/config.json` — router config (providers + routes)
+- `~/.claude-code-router/nim.env` — your API keys (chmod 600), one `KEYVAR=value` per line
 
 ## Self-hosted NIM
 
@@ -101,8 +128,10 @@ Pointed at NVIDIA's hosted cloud by default. For a self-hosted NIM deployment, r
 ## Caveats
 
 - **Tool use / agentic loops**: `ccr` translates Anthropic's tool format to OpenAI function-calling. Most NIM models support it, but smaller models can be less reliable than Claude for long agent sessions.
-- **Install the npm package**, not the CCR *desktop* app — the desktop app uses a SQLite config and different CLI; this script targets `@musistudio/claude-code-router` (the `ccr` CLI with `config.json`).
-- **NVIDIA rate limits** apply on the NIM side regardless of your Claude plan.
+- **Install the npm v1.x CLI package**, not the CCR *desktop* app — the desktop app (v2/v3) uses a SQLite config and has no `ccr code`/`ccr activate`. Pin it: `npm install -g @musistudio/claude-code-router@1.0.73`. `nim doctor` and `nim status` detect a wrong version and tell you how to fix it.
+- **The gateway only gets your key if it's started with the key in its environment.** `nim on` always `load_env`s your keys and `ccr restart`s before launching, so this is handled automatically. If you manually started `ccr` without the key, you'll see a `401` from the provider — run `nim restart` (or just `nim`, which restarts for you).
+- **`~/.claude/settings.json` model pins** (e.g. `"model": "opus[1m]"`) are fine — `ccr` routes any requested Claude model name to your configured default, so the pin resolves to your NIM model transparently.
+- **NVIDIA rate limits / transient 503** ("ResourceExhausted") apply on the NIM side regardless of your Claude plan; just retry.
 
 ## License
 
