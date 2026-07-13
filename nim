@@ -20,6 +20,7 @@
 #   nim route           Show how requests are routed (default / background / think / longContext)
 #   nim route set <kind> <model>   e.g. nim route set think deepseek-ai/deepseek-v4-pro
 #
+#   nim ping           Ping the active default model directly (bypasses ccr) — catches a broken model
 #   nim doctor          Diagnose the whole chain (ccr, config, key, gateway, provider, live ping)
 #   nim status          Show install state, active provider, key, default model, endpoint
 #   nim key [KEYVAR]    Set an API key (default: active provider's key, stored in nim.env, chmod 600)
@@ -247,6 +248,50 @@ set_default_model() {
   ' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
   ok "Default model set to: $provider,$model"
   if have ccr; then load_env; ccr restart >/dev/null 2>&1 || true; fi
+}
+
+# Ping a provider's model directly (bypasses ccr) with a tiny completion request.
+# Args: provider model. Prints a one-line classification. Returns: 0 healthy,
+# 2 transient (429/503), 1 broken (empty 200 / 401 / 403 / 404 / timeout / other).
+# Catches a flaky default model BEFORE it surfaces as cryptic ccr 500s mid-task.
+ping_model() {
+  local provider="${1:-}" model="${2:-}" keep=0
+  [[ -n "$provider" && -n "$model" ]] || return 1
+  local url kv key content code rc=1
+  url=$(jq -r --arg n "$provider" '.Providers[]|select(.name==$n)|.api_base_url // ""' "$CONFIG" 2>/dev/null)
+  [[ -n "$url" ]] || { printf 'no endpoint configured for %s\n' "$provider"; return 1; }
+
+  local -a auth=()
+  kv=$(jq -r --arg n "$provider" '.Providers[]|select(.name==$n)|.api_key // ""' "$CONFIG" 2>/dev/null | sed 's#^\$##')
+  if [[ -n "$kv" && "$kv" != "null" && "$kv" != "-" ]]; then
+    key=$(key_for_keyvar "$kv")
+    [[ -n "$key" ]] || { printf "key '%s' not set (run: nim key %s)\n" "$kv" "$kv"; return 1; }
+    auth=(-H "Authorization: Bearer $key")
+  fi
+
+  local body; body=$(mktemp -t nim_ping.XXXXXX 2>/dev/null || printf '/tmp/nim_ping.%s' "$$")
+  code=$(curl -sS -m 30 -o "$body" -w "%{http_code}" \
+    "${auth[@]}" -H "Content-Type: application/json" \
+    "$url" -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":5,\"stream\":false}" 2>/dev/null) || code=000
+
+  case "$code" in
+    000) printf 'timeout / unreachable (endpoint %s)\n' "$url" ;;
+    200)
+      content=$(jq -r '.choices[0].message.content // empty' "$body" 2>/dev/null || true)
+      if [[ -n "$content" && "$content" != "null" ]]; then
+        rc=0; printf 'ok — model replied\n'
+      else
+        printf 'empty response (HTTP 200 but no completion content) — model is likely broken. Switch: nim use <other-model> | nim models --all\n'
+      fi ;;
+    429) rc=2; printf 'HTTP 429 rate-limited (transient — model works but throttled now)\n' ;;
+    503) rc=2; printf 'HTTP 503 provider capacity (transient)\n' ;;
+    401) printf 'HTTP 401 unauthorized — bad/missing key (run: nim key %s)\n' "$kv" ;;
+    403) printf 'HTTP 403 forbidden — key lacks access to %s,%s\n' "$provider" "$model" ;;
+    404) printf "HTTP 404 — model '%s' not found on '%s'. Switch: nim models --all\n" "$model" "$provider" ;;
+    *)   keep=1; printf 'HTTP %s — unexpected (body kept at %s)\n' "$code" "$body"; rc=2 ;;
+  esac
+  [[ "$keep" -eq 1 ]] || rm -f "$body" 2>/dev/null
+  return "$rc"
 }
 
 # Interactive picker. Reads candidate model IDs from stdin, prints chosen one.
@@ -516,6 +561,24 @@ cmd_route() {
   esac
 }
 
+cmd_ping() {
+  require_jq || return 1
+  ensure_config
+  load_env
+  local provider model
+  provider=$(active_provider)
+  model=$(current_default_model)
+  [[ -n "$provider" && -n "$model" ]] || { err "No active default model set. Run: nim use <model>"; return 1; }
+  info "Pinging $provider,$model directly (bypasses ccr)..."
+  local rc=0 msg
+  msg=$(ping_model "$provider" "$model") || rc=$?
+  case "$rc" in
+    0) ok "$provider,$model: $msg" ;;
+    2) info "$provider,$model: $msg" ;;
+    *) err "$provider,$model: $msg"; return 1 ;;
+  esac
+}
+
 cmd_doctor() {
   require_jq || return 1
   echo "=== nim doctor ==="
@@ -546,6 +609,22 @@ cmd_doctor() {
     else
       ok "active provider needs no key"; pass=$((pass+1));
     fi
+
+    # Direct provider ping of the active default model (bypasses ccr).
+    # Catches a broken/flaky default model (empty 200, 404, 401) before it
+    # surfaces as cryptic ccr 500s mid-task — e.g. a model returning {}.
+    local dmodel; dmodel=$(current_default_model)
+    if [[ -n "$provider" && -n "$dmodel" ]]; then
+      load_env
+      local pmsg prc
+      info "pinging default model $provider,$dmodel directly (bypasses ccr)..."
+      prc=0; pmsg=$(ping_model "$provider" "$dmodel") || prc=$?
+      case "$prc" in
+        0) ok "default model $provider,$dmodel: $pmsg"; pass=$((pass+1)) ;;
+        2) info "default model $provider,$dmodel: $pmsg" ;;
+        *) err "$provider,$dmodel: $pmsg"; fail=$((fail+1)) ;;
+      esac
+    fi
   fi
 
   if have ccr && [[ -f "$CONFIG" ]]; then
@@ -554,15 +633,16 @@ cmd_doctor() {
     ccr restart >/dev/null 2>&1 || true
     sleep 1
     local code
-    code=$(curl -s -o /tmp/nim_doctor.json -w "%{http_code}" -X POST http://127.0.0.1:3456/v1/messages \
+    code=$(curl -s -m 40 -o /tmp/nim_doctor.json -w "%{http_code}" -X POST http://127.0.0.1:3456/v1/messages \
       -H "Content-Type: application/json" -H "x-api-key: test" -H "anthropic-version: 2023-06-01" \
-      -d '{"model":"claude-opus-4-8[1m]","max_tokens":5,"messages":[{"role":"user","content":"ping"}]}' 2>/dev/null || echo 000)
+      -d '{"model":"claude-opus-4-8[1m]","max_tokens":5,"messages":[{"role":"user","content":"ping"}]}' 2>/dev/null) || code=000
     case "$code" in
       200) ok "end-to-end gateway -> provider: HTTP 200 ✓"; pass=$((pass+1)); rm -f /tmp/nim_doctor.json ;;
       429|503) info "reached provider but got HTTP $code (transient provider capacity — retry later)"; rm -f /tmp/nim_doctor.json ;;
       401) err "end-to-end HTTP 401 from provider — gateway lacks the key. Run: nim key, then nim restart"; fail=$((fail+1)); rm -f /tmp/nim_doctor.json ;;
       404) err "end-to-end HTTP 404 — model not available for your account. Switch: nim models --all"; fail=$((fail+1)); rm -f /tmp/nim_doctor.json ;;
-      000) err "gateway not reachable on :3456 (is ccr running?). Run: nim restart"; fail=$((fail+1)); ;;
+      000) err "no response from gateway on :3456 (is ccr running? run: nim restart) — or the upstream provider timed out (run: nim ping)"; fail=$((fail+1)); ;;
+      500) err "end-to-end HTTP 500 — provider returned an empty/bad response (flaky model?). Run: nim ping"; fail=$((fail+1)); rm -f /tmp/nim_doctor.json ;;
       *)    err "end-to-end HTTP $code — see /tmp/nim_doctor.json"; fail=$((fail+1)); rm -f /tmp/nim_doctor.json ;;
     esac
   fi
@@ -673,6 +753,7 @@ main() {
     ls|list)         cmd_ls ;;
     provider)        shift; cmd_provider "$@" ;;
     route)           shift; cmd_route "$@" ;;
+    ping)            shift; cmd_ping "$@" ;;
     doctor)          shift; cmd_doctor "$@" ;;
     key)             shift; cmd_key "$@" ;;
     config)          cmd_config ;;

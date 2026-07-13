@@ -79,6 +79,7 @@ nim ls              # list configured models (* = current default)
 | `nim route set <kind> <model>` | Set a route, e.g. `nim route set think deepseek-ai/deepseek-v4-pro` |
 | `nim key [KEYVAR]` | Set an API key (default: the active provider's key; stored in `~/.claude-code-router/nim.env`, chmod 600) |
 | `nim doctor` | Diagnose the whole chain — ccr, config, key, gateway, and a live end-to-end ping |
+| `nim ping` | Ping the active default model directly (bypasses ccr) — catches a broken/flaky model before it surfaces as cryptic 500s |
 | `nim status` | Show install state, active provider, key, default model, endpoint |
 | `nim config` | Edit the router config in `$EDITOR`, then reloads the router |
 | `nim restart` | Reload the router after editing config/key |
@@ -134,6 +135,7 @@ Pointed at NVIDIA's hosted cloud by default. For a self-hosted NIM deployment, r
 - **The gateway only gets your key if it's started with the key in its environment.** `nim on` always `load_env`s your keys and `ccr restart`s before launching, so this is handled automatically. If you manually started `ccr` without the key, you'll see a `401` from the provider — run `nim restart` (or just `nim`, which restarts for you).
 - **`~/.claude/settings.json` model pins** (e.g. `"model": "opus[1m]"`) are fine — `ccr` routes any requested Claude model name to your configured default, so the pin resolves to your NIM model transparently.
 - **NVIDIA rate limits / transient 503** ("ResourceExhausted") apply on the NIM side regardless of your Claude plan; just retry.
+- **A model can return `HTTP 200` with an empty completion** (`choices: []`, `usage: null`) when it's overloaded or broken upstream — `ccr` converts that into a `500 Provider error` mid-task. This is per-model (e.g. `z-ai/glm-5.2` has had outages while `deepseek-v4-pro` stayed up). If you hit unexplained 500s, run `nim ping` to check the active default model directly; if it's broken, switch with `nim use <model>` (or pick from the live list with `nim models --all`). `nim doctor` runs this ping as part of its checks.
 
 ## License
 
